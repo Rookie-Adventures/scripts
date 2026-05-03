@@ -1,0 +1,17 @@
+{
+  "context": {
+    "loadMemoryFromIncludeDirectories": true
+  },
+  "experimental": {
+    "contextManagement": true,
+    "generalistProfile": false
+  },
+  "tools": {
+    "disableLLMCorrection": false
+  },
+  "security": {
+    "environmentVariableRedaction": {
+      "enabled": true
+    }
+  }
+}
