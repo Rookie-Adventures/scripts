@@ -13,5 +13,30 @@
     "environmentVariableRedaction": {
       "enabled": true
     }
+  },
+  "ide": {
+    "enabled": true
+  },
+  "billing": {
+    "overageStrategy": "ask"
+  },
+  "model": {
+    "name": ""
+  },
+  "ui": {
+    "terminalBuffer": true,
+    "showLineNumbers": false,
+    "showCitations": true,
+    "showUserIdentity": true
+  },
+  "general": {
+    "sessionRetention": {
+      "maxAge": "30d"
+    },
+    "plan": {
+      "enabled": false
+    },
+    "defaultApprovalMode": "auto_edit",
+    "preferredEditor": "vscode"
   }
 }

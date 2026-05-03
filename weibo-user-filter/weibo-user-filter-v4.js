@@ -29,8 +29,61 @@ const CONFIG = {
   FILTERS: { maxFollowers: 10, gender: 'f', locations: ['台湾', '新加坡', '香港', '澳大利亚', '新西兰', '日本', '马来西亚'], registeredAfter: new Date('2010-01-01'), birthdayBefore: new Date('1990-01-01'), ipLocations: [] },
   TELEGRAM: { ENABLED: true, BOT_TOKEN: process.env.TG_BOT_TOKEN || '8715953818:AAGgILx6Hway2OooEjZxpD9ENRZ4rd1iLxI', CHAT_ID: process.env.TG_CHAT_ID || '-1003729234221', ALERT_CHAT_ID: process.env.TG_ALERT_CHAT_ID || '-1003729234221' },
   ALERT: { ENABLED: true, ON_ERROR: true, ON_COMPLETE: true, MAX_ERRORS: 3 },
-  CLEANUP: { DELETE_RAW: false, DELETE_AFTER_PUSH: false, KEEP_DAYS: 7 }
+  CLEANUP: { DELETE_RAW: false, DELETE_AFTER_PUSH: false, KEEP_DAYS: 7 },
+  DEDUP: { ENABLED: true, FILE_PATH: path.join(__dirname, 'dedup-history.json') }
 };
+
+// 引入 dotenv 和 Upstash Redis
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { Redis } = require('@upstash/redis');
+
+let redisClient = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    redisClient = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+  }
+} catch (e) {
+  log(`Redis 初始化异常: ${e.message}`, 'WARN');
+}
+
+// ============ 去重管理 (Enterprise Grade) ============
+class RedisDedupManager {
+  constructor() {
+    this.redis = redisClient;
+    this.redisKey = 'weibo_dedup_history';
+    if (!this.redis) {
+      log('⚠️ 未检测到 Upstash Redis 配置，请检查 .env 环境变量', 'WARN');
+    }
+  }
+  
+  async isDuplicate(uid) {
+    if (!this.redis) return false;
+    try {
+      const exists = await this.redis.sismember(this.redisKey, String(uid));
+      return exists === 1;
+    } catch (e) {
+      log(`Redis 查询去重失败: ${e.message}`, 'WARN');
+      return false;
+    }
+  }
+  
+  async addBatch(uids) {
+    if (!this.redis || !uids || uids.length === 0) return;
+    try {
+      const strUids = uids.map(id => String(id));
+      await this.redis.sadd(this.redisKey, ...strUids);
+      log(`🛡️ 去重管理：已将 ${uids.length} 个新用户保存到云端 Redis 数据库`, 'INFO');
+    } catch (e) {
+      log(`Redis 保存去重记录失败: ${e.message}`, 'ERROR');
+    }
+  }
+}
+
+// 延迟初始化以获取最新的 CONFIG
+let DEDUP_MANAGER;
 
 // ============ 请求头配置 ============
 const HEADERS = {
@@ -827,8 +880,44 @@ async function processSingle(weiboId, options, cookiePool) {
     return []; 
   }
   
-  const base = likes.filter(u => (parseInt(u.user.followers_count) || 0) <= options.filters.maxFollowers);
+  // 1. 初筛（无代价）：粉丝数等基本信息过滤
+  let base = likes.filter(u => (parseInt(u.user.followers_count) || 0) <= options.filters.maxFollowers);
   log(`✓ 初筛：${base.length}人（粉丝≤${options.filters.maxFollowers}）`);
+
+  // 2. 去重（有代价）：仅对初筛通过的人进行云端查询
+  if (CONFIG.DEDUP.ENABLED) {
+    if (!DEDUP_MANAGER) DEDUP_MANAGER = new RedisDedupManager();
+    const beforeCount = base.length;
+    
+    if (beforeCount > 0) {
+      log(`🛡️ 正在进行云端 Redis 去重检查（对初筛通过的 ${beforeCount} 人）...`, 'INFO');
+      
+      // 使用 Pipeline 批量查询
+      let isDupResults = [];
+      if (DEDUP_MANAGER.redis) {
+        try {
+          const pipeline = DEDUP_MANAGER.redis.pipeline();
+          base.forEach(u => pipeline.sismember(DEDUP_MANAGER.redisKey, String(u.user.id)));
+          const results = await pipeline.exec();
+          
+          isDupResults = base.map((u, index) => ({
+            user: u,
+            isDup: results[index] === 1
+          }));
+        } catch (e) {
+          log(`批量去重检查失败，降级为不去重: ${e.message}`, 'WARN');
+          isDupResults = base.map(u => ({ user: u, isDup: false }));
+        }
+      } else {
+        isDupResults = base.map(u => ({ user: u, isDup: false }));
+      }
+      
+      base = isDupResults.filter(r => !r.isDup).map(r => r.user);
+      
+      const dupCount = beforeCount - base.length;
+      if (dupCount > 0) log(`🛡️ 去重拦截：已过滤 ${dupCount} 个历史重复用户（不再重复分析）`, 'INFO');
+    }
+  }
   
   // 没有 Cookie 时，直接使用基础信息筛选，跳过详细信息获取
   const hasCookie = cookiePool && cookiePool.cookies.length > 0;
@@ -995,6 +1084,13 @@ ${CONFIG.FILTERS.birthdayBefore ? '🎂 生日: ' + CONFIG.FILTERS.birthdayBefor
   - 或者尝试其他微博帖子`;
     
     await sendTelegramAlert(message, false); // 发送到普通频道，不是报警频道
+  }
+  
+  // 方案 B：将所有"已经消耗了 Cookie 去获取详情"的用户存入 Redis 黑白名单
+  // 这样下次再遇到他们，就不会再浪费 Cookie 去查主页了
+  if (CONFIG.DEDUP.ENABLED && DEDUP_MANAGER && details && details.length > 0) {
+    const uidsToSave = details.map(u => u.id); // 保存的是 details，包含了所有被处理过的人
+    await DEDUP_MANAGER.addBatch(uidsToSave);
   }
   
   cleanupData(weiboId);
