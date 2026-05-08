@@ -1,4 +1,5 @@
-   const { chromium } = require('playwright');
+   // account-manager.js - Automated Playwright Cookie Manager
+const { chromium } = require('playwright');
    const fs = require('fs');
    const path = require('path');
 

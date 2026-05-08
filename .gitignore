@@ -1,8 +1,9 @@
    node_modules/
    package-lock.json
    .env
-   auth_data/*
+   auth_data/
    output.json
    output.csv
    dedup-history.json
    dedup-history.csv
+   F:\scripts\weibo-user-filter\auth_data
