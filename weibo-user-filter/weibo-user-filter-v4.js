@@ -17,6 +17,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const { execSync } = require('child_process');
 
 // ============ 配置 ============
 const CONFIG = {
@@ -127,8 +128,11 @@ const STATE = {
   totalCollected: 0,      // 总采集数
   totalFiltered: 0,       // 初筛通过数
   totalMatched: 0,        // 完全匹配数
-  totalReview: 0          // 需要审核数
+  totalReview: 0,         // 需要审核数
+  processedSinceLastMatch: 0 // 记录自上次产出以来处理的用户数
 };
+
+const HEALTH_CHECK_THRESHOLD = 300;
 
 // ============ 日志 ============
 function log(msg, level = 'INFO') {
@@ -265,15 +269,15 @@ function httpGet(url, headers = {}) {
       
       let data = '';
       stream.on('data', c => data += c);
-      stream.on('end', () => { 
-        try { 
-          resolve(JSON.parse(data)); 
-        } catch (e) { 
-          resolve({ error: e.message, rawData: data.substring(0, 200) }); 
-        } 
+      stream.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed);
+        } catch (e) {
+          resolve({ error: e.message, statusCode: res.statusCode, rawData: data.substring(0, 200) });
+        }
       });
-      stream.on('error', e => {
-        // 清理流
+      stream.on('error', e => {        // 清理流
         stream.destroy();
         reject(e);
       });
@@ -380,36 +384,74 @@ async function getLikeUsers(weiboId, maxPage = 30, cookiePool = null) {
   
   const all = [];
   for (let p = 1; p <= maxPage; p++) {
-    try {
-      const url = `${CONFIG.LIKES_API}?id=${useId}&page=${p}`;
-      const headers = { ...HEADERS.mobile };
-      
-      // 如果提供了 Cookie 池，使用当前 Cookie 并轮换
-      if (cookiePool && cookiePool.cookies.length > 0) {
-        const cookie = cookiePool.getCurrent();
-        if (cookie) {
-          headers['Cookie'] = cookie;
-          cookiePool.record();
-          // 每 5 页轮换一次 Cookie，避免单个账号请求过多
-          if (p % 5 === 0) {
-            cookiePool.rotate();
-            log(`🔄 轮换 Cookie（第${p}页，可用：${cookiePool.getAvailableCount()}）`);
+    let attempts = 0;
+    // 至少尝试 1 次，如果有池则最多尝试可用 cookie 数量（最多 3 次）
+    const maxAttempts = cookiePool ? Math.max(1, Math.min(3, cookiePool.getAvailableCount())) : 1;
+    let pageSuccess = false;
+
+    while (attempts < maxAttempts) {
+      try {
+        const url = `${CONFIG.LIKES_API}?id=${useId}&page=${p}`;
+        const headers = { ...HEADERS.mobile };
+        
+        let currentCookie = null;
+        // 如果提供了 Cookie 池，使用当前 Cookie 并轮换
+        if (cookiePool && cookiePool.cookies.length > 0) {
+          currentCookie = cookiePool.getCurrent();
+          if (currentCookie) {
+            headers['Cookie'] = currentCookie;
+            // 正常的轮换（非重试情况下，每 5 页轮换一次）
+            if (attempts === 0 && p % 5 === 0) {
+              cookiePool.rotate();
+              log(`🔄 轮换 Cookie（第${p}页，可用：${cookiePool.getAvailableCount()}）`);
+              currentCookie = cookiePool.getCurrent();
+              if (currentCookie) headers['Cookie'] = currentCookie;
+            }
           }
         }
+        
+        const res = await httpGet(url, headers);
+        
+        // 判断是否失败（302 跳转或解析 JSON 失败通常意味着 Cookie 失效）
+        if (res.ok !== 1 || res.error) {
+          if (res.statusCode === 302 || res.statusCode === 403 || res.error) {
+            if (cookiePool && currentCookie) {
+              cookiePool.markFailed(currentCookie);
+              cookiePool.rotate();
+            }
+            attempts++;
+            log(`⚠️ 第${p}页请求异常 (Status: ${res.statusCode || 'N/A'}, Error: ${res.error || ''})，判定 Cookie 失效，尝试重试 (${attempts}/${maxAttempts})...`, 'WARN');
+            await sleep(1000);
+            continue; // 重试当前页
+          }
+          
+          log(`第${p}页返回：ok=${res.ok}, msg=${res.msg || ''}, error=${res.error || ''}`, 'WARN');
+          if (res.error) log(`详细错误：${JSON.stringify(res).substring(0, 200)}`, 'WARN');
+          break; // 不可重试的错误，跳出当前页的尝试
+        }
+        
+        if (cookiePool) cookiePool.record();
+        const users = res.data?.data || [];
+        all.push(...users);
+        log(`✓ 第${p}页：${users.length}人`);
+        pageSuccess = true;
+        
+        if (users.length < 50) p = maxPage; // 设置循环条件为最后一次，等同于跳出外层循环
+        break; // 成功，跳出重试循环
+      } catch (e) {
+        log(`第${p}页失败：${e.message}`, 'ERROR');
+        attempts++;
+        if (attempts >= maxAttempts) break;
+        await sleep(1000);
       }
-      
-      const res = await httpGet(url, headers);
-      if (res.ok !== 1) {
-        log(`第${p}页返回：ok=${res.ok}, msg=${res.msg || ''}, error=${res.error || ''}`, 'WARN');
-        if (res.error) log(`详细错误：${JSON.stringify(res).substring(0, 200)}`, 'WARN');
-        break;
-      }
-      const users = res.data?.data || [];
-      all.push(...users);
-      log(`✓ 第${p}页：${users.length}人`);
-      if (users.length < 50) break;
-      await sleep(1000);  // 增加到1秒延迟
-    } catch (e) { log(`第${p}页失败：${e.message}`, 'ERROR'); break; }
+    }
+
+    if (!pageSuccess && attempts >= maxAttempts) {
+      log(`⚠️ 第${p}页多次重试均失败，终止获取后续点赞页`, 'WARN');
+      break;
+    }
+
+    if (p < maxPage) await sleep(1000);  // 成功获取后增加延迟
   }
   log(`✅ 共${all.length}人`);
   return all;
@@ -596,43 +638,45 @@ function filterUsers(users, filters) {
   const stats = { total: users.length, excluded: { male: 0, followers: 0, location: 0, ip_location: 0, registered: 0, birthday: 0 }, passed: { p1: 0, p2: 0, p3: 0 } };
   
   for (const u of users) {
+    // 1. 初筛逻辑兜底（虽然已经在 processSingle 做过，但保持函数完整性）
     if (filters.gender === 'f' && u.gender === 'm') { stats.excluded.male++; continue; }
     if (filters.maxFollowers !== undefined && u.followers_count > filters.maxFollowers) { stats.excluded.followers++; continue; }
     
-    // 地区筛选（用户填写地区 + IP属地双重检查）
+    // 2. 地区筛选：二筛变严格，如果不符合目标地区列表，直接排除
     if (filters.locations && filters.locations.length > 0) {
       if (u.location || u.ip_location) {
         const locMatch = u.location && filters.locations.some(l => u.location.includes(l));
         const ipMatch = u.ip_location && filters.locations.some(l => u.ip_location.includes(l));
-        if (!locMatch && !ipMatch) { stats.excluded.location++; continue; }
+        // 关键逻辑：如果存在地区信息但都不在白名单内，直接排除
+        if (!locMatch && !ipMatch) { 
+          stats.excluded.location++; 
+          continue; 
+        }
       }
+      // 如果完全没有位置和IP信息，保留到 P2/P3 审核
     }
     
-    // IP属地单独筛选
-    if (filters.ipLocations && filters.ipLocations.length > 0) {
-      if (u.ip_location) {
-        const ipMatch = u.ip_location && filters.ipLocations.some(l => u.ip_location.includes(l));
-        if (!ipMatch) { stats.excluded.ip_location++; continue; }
-      }
-    }
-    
-    // 注册时间筛选
+    // 3. 注册时间：按要求放开，代码注释掉，不再执行排除
+    /*
     if (filters.registeredAfter && u.created_at) {
       const regDate = parseDate(u.created_at);
       if (regDate && regDate < filters.registeredAfter) { stats.excluded.registered++; continue; }
     }
+    */
     
-    // 生日筛选（只对比有完整年份的日期）
+    // 4. 生日筛选
     if (filters.birthdayBefore && u.birthday) {
-      // 简单的正则匹配：必须包含 4 位年份才做强对比
-      if (/^\d{4}/.test(u.birthday.trim())) {
-        const birthDate = parseDate(u.birthday);
-        if (!birthDate || birthDate >= filters.birthdayBefore) { 
+      const birthStr = u.birthday.trim();
+      // 只有包含 4 位年份才做强对比判断
+      if (/^\d{4}/.test(birthStr)) {
+        const birthDate = parseDate(birthStr);
+        // 如果生日在 1990-01-01 之后（即 >= 1990），直接排除
+        if (birthDate && birthDate >= filters.birthdayBefore) { 
           stats.excluded.birthday++; 
           continue; 
         }
       }
-      // 只有月日或星座的，不排除，交由人工审核
+      // 如果没有年份（只有月日、星座）或者为空，代码会跳过排除，进入下方的人工审核逻辑
     }
     
     const missing = [];
@@ -640,8 +684,6 @@ function filterUsers(users, filters) {
     if (!u.location && !u.ip_location && filters.locations && filters.locations.length > 0) missing.push('地区/IP');
     if (!u.birthday && filters.birthdayBefore) missing.push('生日');
     else if (u.birthday && !/^\d{4}/.test(u.birthday.trim()) && filters.birthdayBefore) missing.push('完整生日');
-    if (!u.created_at && filters.registeredAfter) missing.push('注册时间');
-    if (!u.ip_location && filters.ipLocations && filters.ipLocations.length > 0) missing.push('IP属地');
     
     const priority = missing.length === 0 ? 1 : missing.length === 1 ? 2 : 3;
     filtered.push({ ...u, priority, missing });
@@ -652,7 +694,7 @@ function filterUsers(users, filters) {
   }
   
   filtered.sort((a, b) => a.priority - b.priority);
-  log(`📊 原始${stats.total} | 排除：男${stats.excluded.male} 粉超${stats.excluded.followers} 地区${stats.excluded.location} IP${stats.excluded.ip_location} 注册${stats.excluded.registered} 生日${stats.excluded.birthday} | 通过：${filtered.length} (P1${stats.passed.p1} P2${stats.passed.p2} P3${stats.passed.p3})`, '📈');
+  log(`📊 原始${stats.total} | 排除：地区${stats.excluded.location} 生日${stats.excluded.birthday} | 通过：${filtered.length} (P1${stats.passed.p1} P2${stats.passed.p2} P3${stats.passed.p3})`, '📈');
   return filtered;
 }
 
@@ -693,7 +735,8 @@ async function pushToTelegram_v2(matched, review, weiboIds, outputCsv, totalColl
   // 发送用户名单（完全匹配）
   if (matched && matched.length > 0) {
     let userList = `✅ 完全匹配用户名单（${matched.length}人）\n\n`;
-    matched.forEach((u, i) => {
+    const displayMatched = matched.slice(0, 30);
+    displayMatched.forEach((u, i) => {
       const name = u.screen_name || `用户${u.id}`;
       const followers = u.followers_count || 0;
       const location = u.location || u.ip_location || '未知';
@@ -701,6 +744,9 @@ async function pushToTelegram_v2(matched, review, weiboIds, outputCsv, totalColl
       userList += `${i+1}. ${name} | 粉丝${followers} | ${location} | ${birthday}\n`;
       userList += `   👤 https://weibo.com/u/${u.id}\n\n`;
     });
+    if (matched.length > 30) {
+      userList += `...（展示前30名，更多用户请查看附件）\n`;
+    }
     await sendTelegramAlert(userList);
     await sleep(500);
   }
@@ -708,7 +754,8 @@ async function pushToTelegram_v2(matched, review, weiboIds, outputCsv, totalColl
   // 发送用户名单（需要审核）
   if (review && review.length > 0) {
     let reviewList = `⚠️ 需要审核用户名单（${review.length}人）\n\n`;
-    review.forEach((u, i) => {
+    const displayReview = review.slice(0, 30);
+    displayReview.forEach((u, i) => {
       const name = u.screen_name || `用户${u.id}`;
       const followers = u.followers_count || 0;
       const location = u.location || u.ip_location || '未知';
@@ -716,6 +763,9 @@ async function pushToTelegram_v2(matched, review, weiboIds, outputCsv, totalColl
       reviewList += `${i+1}. ${name} | 粉丝${followers} | ${location} | ${birthday}\n`;
       reviewList += `   👤 https://weibo.com/u/${u.id}\n\n`;
     });
+    if (review.length > 30) {
+      reviewList += `...（展示前30名，更多用户请查看附件）\n`;
+    }
     await sendTelegramAlert(reviewList);
     await sleep(500);
   }
@@ -840,6 +890,34 @@ function cleanupData(weiboId) {
         }
       });
     } catch (e) { log(`删除输出文件失败：${e.message}`, 'ERROR'); }
+  }
+}
+
+async function autoRefreshCookies(options) {
+  log('\n🚨 检测到产出异常（连续 300 人无匹配），尝试自动刷新 Cookie...', 'WARN');
+  await sendTelegramAlert('🚨 微博筛选警告：连续 300 人无匹配，正在尝试自动刷新 Cookie...', true);
+  
+  try {
+    // 调用外部 account-manager.js
+    execSync('node account-manager.js', { stdio: 'inherit', cwd: __dirname });
+    
+    log('✅ Cookie 刷新脚本执行完毕，重新加载池...', 'SUCCESS');
+    
+    // 重新加载池
+    if (fs.existsSync(CONFIG.COOKIE_POOL_PATH)) {
+      options.cookiePool = CookiePool.loadFromFile(CONFIG.COOKIE_POOL_PATH);
+    }
+    if (fs.existsSync(CONFIG.MOBILE_COOKIE_PATH)) {
+      options.mobileCookiePool = CookiePool.loadFromFile(CONFIG.MOBILE_COOKIE_PATH);
+    }
+    
+    STATE.processedSinceLastMatch = 0; // 重置计数
+    await sendTelegramAlert('✅ Cookie 自动刷新完成，任务继续。', false);
+    return true;
+  } catch (e) {
+    log(`❌ 自动刷新 Cookie 失败: ${e.message}`, 'ERROR');
+    await sendErrorAlert('自动刷新失败', e.message);
+    return false;
   }
 }
 
@@ -1041,11 +1119,21 @@ ${CONFIG.FILTERS.birthdayBefore ? '🎂 生日: ' + CONFIG.FILTERS.birthdayBefor
   STATE.totalCollected += likes.length;
   STATE.totalFiltered += base.length;
   
+  // 分成两组：完全匹配 vs 需要审核
+  const matched = filtered.filter(u => u.priority === 1);
+  const review = filtered.filter(u => u.priority > 1);
+
+  // 动态更新健康检测计数器（只有出现完全匹配用户时才重置）
+  if (matched.length > 0) {
+    STATE.processedSinceLastMatch = 0;
+  } else {
+    STATE.processedSinceLastMatch += details.length;
+    if (STATE.processedSinceLastMatch >= HEALTH_CHECK_THRESHOLD) {
+      await autoRefreshCookies(options);
+    }
+  }
+  
   if (filtered.length > 0) {
-    // 分成两组：完全匹配 vs 需要审核
-    const matched = filtered.filter(u => u.priority === 1);
-    const review = filtered.filter(u => u.priority > 1);
-    
     // 更新统计
     STATE.totalMatched += matched.length;
     STATE.totalReview += review.length;
