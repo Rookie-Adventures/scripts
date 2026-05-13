@@ -101,22 +101,27 @@ const HEADERS = {
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin'
   },
-  pc: (cookie) => ({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Referer': 'https://weibo.com/',
-    'Origin': 'https://weibo.com',
-    'Connection': 'keep-alive',
-    'Cookie': cookie,
-    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin'
-  })
+  pc: (cookie) => {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': 'https://weibo.com/',
+      'Origin': 'https://weibo.com',
+      'Connection': 'keep-alive',
+      'Cookie': cookie,
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin'
+    };
+    const xsrf = cookie.match(/XSRF-TOKEN=([^;]+)/);
+    if (xsrf) headers['x-xsrf-token'] = xsrf[1];
+    return headers;
+  }
 };
 
 // 状态追踪
@@ -644,16 +649,14 @@ function filterUsers(users, filters) {
     
     // 2. 地区筛选：二筛变严格，如果不符合目标地区列表，直接排除
     if (filters.locations && filters.locations.length > 0) {
-      if (u.location || u.ip_location) {
-        const locMatch = u.location && filters.locations.some(l => u.location.includes(l));
-        const ipMatch = u.ip_location && filters.locations.some(l => u.ip_location.includes(l));
-        // 关键逻辑：如果存在地区信息但都不在白名单内，直接排除
-        if (!locMatch && !ipMatch) { 
-          stats.excluded.location++; 
-          continue; 
-        }
+      const locMatch = u.location && filters.locations.some(l => u.location.includes(l));
+      const ipMatch = u.ip_location && filters.locations.some(l => u.ip_location.includes(l));
+      
+      // 关键逻辑：如果设定了地区白名单，只要不匹配就排除（包括没有地区信息的情况）
+      if (!locMatch && !ipMatch) { 
+        stats.excluded.location++; 
+        continue; 
       }
-      // 如果完全没有位置和IP信息，保留到 P2/P3 审核
     }
     
     // 3. 注册时间：按要求放开，代码注释掉，不再执行排除
